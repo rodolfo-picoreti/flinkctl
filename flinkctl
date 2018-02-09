@@ -1,0 +1,205 @@
+#!/usr/bin/python
+
+import requests
+import json
+import os
+import fire
+import arrow
+import sys
+from itertools import ifilter
+
+
+def load_config():
+    locations = ['./config.json',
+                 os.path.join(os.path.expanduser('~'), '.config/flink/config.json')]
+    location = next(ifilter(os.path.isfile, locations), None)
+    if location is None:
+        print 'Failed to read config file'
+        sys.exit(1)
+    else:
+        config = json.load(open(location, 'r'))
+        global uri
+        uri = config['uri']
+
+
+def get_jars():
+    endpoint = uri + '/jars'
+    r = requests.get(endpoint)
+    if r.status_code is 200:
+        return json.loads(r.content)['files'], None
+    return None, 'Failed to get jars @{}\n\n{}'.format(endpoint, r.content)
+
+
+def get_jar(small_id):
+    jars, err = get_jars()
+    if err is not None:
+        return None, err
+
+    jar = next(ifilter(lambda jar: jar['id'].startswith(
+        str(small_id)), jars), None)
+    if jar is None:
+        return None, 'No jar with id {}'.format(small_id)
+    return jar, None
+
+
+def delete_jar(id):
+    jar, err = get_jar(id)
+    if err is not None:
+        return None, err
+
+    endpoint = uri + '/jars/{}'.format(jar['id'])
+    r = requests.delete(endpoint)
+    if r.status_code is 200:
+        return None, None
+    return None, 'Failed to delete jar @{}\n\n{}'.format(endpoint, r.content)
+
+
+def upload_jar(file):
+    name = os.path.basename(file)
+    handle = open(file, 'rb')
+    content_type = 'application/x-java-archive'
+    endpoint = uri + '/jars/upload'
+    r = requests.post(
+        endpoint, files={'jarfile': (name, handle, content_type)})
+
+    if r.status_code is 200:
+        return None, None
+    return None, 'Failed to upload jar="{}" @{}\n\n{}'.format(name, endpoint, r.content)
+
+
+def run_jar(id, entry, args):
+    jar, err = get_jar(id)
+    if err is not None:
+        return None, err
+
+    endpoint = uri + '/jars/{}/run?'.format(jar['id'])
+    if entry is not None:
+        endpoint += 'entry-class={}'.format(entry)
+    if args is not None:
+        endpoint += 'program-args={}'.format(args)
+
+    r = requests.post(endpoint)
+    if r.status_code is 200:
+        return None, None
+    return None, 'Failed to run jar @{}\n\n{}'.format(endpoint, r.content)
+
+
+def get_jobs():
+    endpoint = uri + '/joboverview'
+    r = requests.get(endpoint)
+    if r.status_code is 200:
+        jobs = json.loads(r.content)
+        return jobs['running'] + jobs['finished'], None
+    return None, 'Failed to get jobs @{}'.format(endpoint)
+
+
+def get_job_ids():
+    endpoint = uri + '/jobs'
+    r = requests.get(endpoint)
+    if r.status_code is 200:
+        jobs = json.loads(r.content)
+        return jobs['jobs-running'] + jobs['jobs-finished'] + jobs['jobs-cancelled'] + jobs['jobs-failed'], None
+    return None, 'Failed to get job ids @{}'.format(endpoint)
+
+
+def get_job_id(small_id):
+    ids, err = get_job_ids()
+    if err is not None:
+        return None, err
+    id = next(ifilter(lambda id: id.startswith(str(small_id)), ids), None)
+    if id is None:
+        return None, 'No job with id {}'.format(small_id)
+    return id, None
+
+
+def get_job(small_id):
+    id, err = get_job_id(small_id)
+    if err is not None:
+        return None, err
+
+    endpoint = uri + '/jobs/{}'.format(id)
+    r = requests.get(endpoint)
+    if r.status_code is 200:
+        return json.loads(r.content), None
+    return None, 'Failed to get job @{}'.format(endpoint)
+
+
+def cancel_job(small_id):
+    id, err = get_job_id(small_id)
+    if err is not None:
+        return None, err
+
+    endpoint = uri + '/jobs/{}/cancel'.format(id)
+    r = requests.delete(endpoint)
+    if r.status_code is 200:
+        return json.loads(r.content), None
+    return None, 'Failed to delete job @{}\n\n{}'.format(endpoint, r.content)
+
+
+class Jars(object):
+    def rm(self, id):
+        ''' Remove a jar file '''
+        _, err = delete_jar(id)
+        if err is not None:
+            print err
+
+    def ls(self):
+        ''' List all uploaded jar files '''
+        jars, err = get_jars()
+        if err is not None:
+            print err
+        else:
+            template = "{:<40} {:<40} {:<20}"
+            print template.format('id', 'name', 'uploaded')
+            for jar in jars:
+                print template.format(jar['id'][:36], jar['name'][:38], arrow.get(jar['uploaded'] / 1000).humanize())
+
+    def upload(self, file):
+        ''' Upload jar file '''
+        _, err = upload_jar(file)
+        if err is not None:
+            print err
+
+    def run(self, id, entry=None, args=None):
+        ''' Run a program with the specified jar '''
+        _, err = run_jar(id, entry, args)
+        if err is not None:
+            print err
+
+
+class Jobs(object):
+    def ls(self):
+        ''' List all jobs in the cluster '''
+        jobs, err = get_jobs()
+        if err is not None:
+            print err
+        else:
+            template = "{:<40} {:<20} {:<13} {:<20}"
+            print template.format('id', 'name', 'state', 'started')
+            for job in jobs:
+                print template.format(job['jid'][:36], job['name'][:18], job['state'][:9], arrow.get(job['start-time'] / 1000).humanize())
+
+    def get(self, id):
+        ''' Summary of one job, listing dataflow plan, status, timestamps of state transitions, aggregate information for each vertex (operator) '''
+        job, err = get_job(id)
+        if err is not None:
+            print err
+        else:
+            print json.dumps(job, indent=2)
+
+    def stop(self, id):
+        ''' Triggers job cancellation '''
+        _, err = cancel_job(id)
+        if err is not None:
+            print err
+
+
+class Flinkctl(object):
+    def __init__(self):
+        self.jars = Jars()
+        self.jobs = Jobs()
+
+
+if __name__ == '__main__':
+    load_config()
+    fire.Fire(Flinkctl)
